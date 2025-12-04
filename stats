@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="zh-Hant-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StatCounter 解析度趨勢分析</title>
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <!-- PapaParse -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+
+    <!-- html2canvas for Screenshots -->
+    <script src="https://html2canvas.hertzen.com/dist/html2canvas.min.js"></script>
+    
+    <style>
+        body { font-family: 'Noto Sans TC', sans-serif; background-color: #f0f4f8; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+        .tab-active { border-bottom: 2px solid #2563EB; color: #2563EB; }
+        .tab-inactive { border-bottom: 2px solid transparent; color: #64748b; }
+        .tab-inactive:hover { color: #334155; }
+        .dashed-border { background-image: url("data:image/svg+xml,%3csvg width='100%25' height='100%25' xmlns='http://www.w3.org/2000/svg'%3e%3crect width='100%25' height='100%25' fill='none' rx='8' ry='8' stroke='%23CBD5E1FF' stroke-width='2' stroke-dasharray='8%2c 8' stroke-dashoffset='0' stroke-linecap='square'/%3e%3c/svg%3e"); }
+        
+        /* Loading Animation */
+        .loader {
+            border: 3px solid #f3f3f3;
+            border-radius: 50%;
+            border-top: 3px solid #3498db;
+            width: 20px;
+            height: 20px;
+            -webkit-animation: spin 2s linear infinite; /* Safari */
+            animation: spin 2s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        /* Drag Overlay */
+        .drag-active {
+            background-color: rgba(59, 130, 246, 0.1);
+            border-color: #3b82f6;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // --- Data Service (Helpers for CSV/Mock/Proxy) ---
+        const DataService = {
+            parseStatCounterCSV: (data) => {
+                if (!data || data.length === 0) return [];
+                const headers = Object.keys(data[0]);
+                const resolutionKey = headers.find(h => h.toLowerCase().includes('resolution'));
+                const shareKey = headers.find(h => h.toLowerCase().includes('share') || h.toLowerCase().includes('perc'));
+                if (!resolutionKey || !shareKey) return [];
+                return data.map(row => ({
+                    label: row[resolutionKey],
+                    value: parseFloat(row[shareKey])
+                })).filter(item => item.label && !isNaN(item.value))
+                   .sort((a, b) => b.value - a.value).slice(0, 15);
+            },
+            
+            // 優化：透過 Proxy 自動抓取 CSV
+            fetchViaProxy: async (targetUrl) => {
+                // 使用 AllOrigins 作為 CORS Proxy
+                const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`;
+                
+                try {
+                    const response = await fetch(proxyUrl);
+                    if (!response.ok) throw new Error('Proxy response error');
+                    
+                    const json = await response.json();
+                    const csvContent = json.contents; 
+                    
+                    if (!csvContent) throw new Error('Empty content');
+
+                    // 檢查是否被擋 (回傳 HTML)
+                    if (csvContent.trim().startsWith('<!DOCTYPE') || csvContent.trim().startsWith('<html')) {
+                         console.warn("被 StatCounter 防火牆阻擋 (Received HTML).");
+                         return null;
+                    }
+
+                    return new Promise((resolve, reject) => {
+                        Papa.parse(csvContent, {
+                            header: true,
+                            skipEmptyLines: true,
+                            complete: (res) => {
+                                const parsed = DataService.parseStatCounterCSV(res.data);
+                                // 關鍵修正：如果解析結果為空，視為失敗
+                                if (parsed && parsed.length > 0) {
+                                    resolve(parsed);
+                                } else {
+                                    resolve(null); // Return null to trigger fallback
+                                }
+                            },
+                            error: (err) => resolve(null)
+                        });
+                    });
+                } catch (error) {
+                    console.warn("Auto-fetch via proxy failed:", error.message);
+                    return null;
+                }
+            },
+
+            readLocalFile: async (file) => {
+                return new Promise((resolve, reject) => {
+                    Papa.parse(file, { header: true, skipEmptyLines: true, complete: (res) => resolve(DataService.parseStatCounterCSV(res.data)), error: reject });
+                });
+            },
+            
+            getMockData: async (filters) => {
+                return new Promise(resolve => {
+                    setTimeout(() => {
+                        let resolutions = [{label:'360x800',value:12.5},{label:'1920x1080',value:10.5},{label:'390x844',value:8.2},{label:'1366x768',value:6.5},{label:'Other',value:38.7}];
+                        if (filters.deviceType === 'desktop') resolutions = resolutions.filter(r => parseInt(r.label.split('x')[0]) > 1000);
+                        resolve(resolutions);
+                    }, 500);
+                });
+            }
+        };
+
+        // --- UI Components ---
+
+        const StatsTable = ({ data, title, filters }) => {
+            if (!data || data.length === 0) return null;
+
+            const handleScreenshot = () => {
+                const element = document.getElementById('stats-table-content');
+                if(!element) return;
+                
+                html2canvas(element, {
+                    backgroundColor: '#ffffff',
+                    scale: 2 // 提高解析度
+                }).then(canvas => {
+                    const link = document.createElement('a');
+                    link.download = `resolution-stats-${filters.monthStart}_${filters.monthEnd}.png`;
+                    link.href = canvas.toDataURL('image/png');
+                    link.click();
+                });
+            };
+
+            return (
+                <div id="stats-table-content" className="bg-white p-6 rounded-xl shadow-lg border-2 border-gray-100 mt-6 animate-fade-in-up">
+                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4 gap-4">
+                        <h3 className="text-lg font-bold text-gray-800 flex items-center gap-2">
+                            <svg className="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                            {title || '詳細數據列表'}
+                        </h3>
+                        
+                        <div className="flex items-center gap-3">
+                            <div className="text-right">
+                                <div className="text-sm font-medium text-gray-700">
+                                    {filters.monthStart} ~ {filters.monthEnd}
+                                </div>
+                                <div className="text-xs text-gray-500">
+                                    (期間平均數據)
+                                </div>
+                            </div>
+                            
+                            <button 
+                                onClick={handleScreenshot}
+                                className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs font-medium transition shadow-sm border border-gray-300"
+                                title="下載表格圖片"
+                            >
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                                截圖表格
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="overflow-x-auto">
+                        <table className="min-w-full text-sm text-left text-gray-500">
+                            <thead className="bg-gray-50 text-xs text-gray-700 uppercase">
+                                <tr>
+                                    <th className="px-6 py-3 rounded-tl-lg">排名</th>
+                                    <th className="px-6 py-3">解析度 (Resolution)</th>
+                                    <th className="px-6 py-3 text-right rounded-tr-lg">市佔率 (Share)</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {data.map((item, idx) => (
+                                    <tr key={idx} className="border-b hover:bg-blue-50 transition-colors">
+                                        <td className="px-6 py-3 font-medium text-gray-900">{idx + 1}</td>
+                                        <td className="px-6 py-3 font-bold text-blue-900">{item.label}</td>
+                                        <td className="px-6 py-3 text-right">
+                                            <div className="flex items-center justify-end gap-2">
+                                                <span className="font-mono">{item.value.toFixed(2)}%</span>
+                                                <div className="w-24 h-2 bg-gray-200 rounded-full overflow-hidden">
+                                                    <div className="h-full bg-blue-600 rounded-full" style={{width: `${Math.min(item.value, 100)}%`}}></div>
+                                                </div>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            );
+        };
+
+        const StatCounterEmbed = ({ filters, onDataLoaded }) => {
+            const [autoSyncStatus, setAutoSyncStatus] = useState('idle'); // idle, loading, success, error
+            const [retryCount, setRetryCount] = useState(0);
+
+            // 產生參數邏輯
+            const getParams = () => {
+                const fromInt = filters.monthStart.replace('-', ''); 
+                const toInt = filters.monthEnd.replace('-', '');
+                
+                const deviceMap = {
+                    'all': 'resolution',          
+                    'mobile': 'mobile-resolution', 
+                    'desktop': 'desktop-resolution', 
+                    'tablet': 'tablet-resolution',
+                    'console': 'console-resolution'
+                };
+                const deviceStr = deviceMap[filters.deviceType] || 'resolution';
+
+                const regionMap = { 'Global': 'ww', 'TW': 'tw', 'JP': 'jp', 'US': 'us', 'CN': 'cn', 'HK': 'hk' };
+                const regionStr = regionMap[filters.region] || 'ww';
+
+                return `${deviceStr}-${regionStr}-monthly-${fromInt}-${toInt}`;
+            };
+
+            const chartId = getParams();
+            const chartSrc = `https://gs.statcounter.com/chart.php?${chartId}&chartWidth=1200`;
+            const csvLink = `https://gs.statcounter.com/chart.php?${chartId}&csv=1`;
+
+            // 自動化邏輯：當 filters 改變時，自動嘗試抓取 CSV
+            useEffect(() => {
+                let isMounted = true;
+                const autoFetch = async () => {
+                    setAutoSyncStatus('loading');
+                    if (onDataLoaded) onDataLoaded(null); 
+                    
+                    // 嘗試自動抓取
+                    const data = await DataService.fetchViaProxy(csvLink);
+                    
+                    if (!isMounted) return;
+
+                    if (data && data.length > 0) {
+                        if (onDataLoaded) onDataLoaded(data);
+                        setAutoSyncStatus('success');
+                    } else {
+                        // 失敗 (回傳 null 或空陣列) 時切換到 Error 狀態 (顯示手動下載 UI)
+                        setAutoSyncStatus('error');
+                    }
+                };
+
+                // 延遲一點執行，避免 React 渲染過快
+                const timer = setTimeout(autoFetch, 1000);
+                return () => {
+                    clearTimeout(timer);
+                    isMounted = false;
+                };
+            }, [chartId]); // 當 chartId (即 filters) 改變時觸發
+
+            const handleFile = async (file) => {
+                if (file) {
+                    try {
+                        const result = await DataService.readLocalFile(file);
+                        if (result && result.length > 0) {
+                            if (onDataLoaded) onDataLoaded(result);
+                            setAutoSyncStatus('success'); // 手動上傳成功也視為成功
+                        } else {
+                            alert("解析結果為空，請確認檔案內容");
+                        }
+                    } catch (e) {
+                        alert("解析失敗，請確認檔案格式");
+                    }
+                }
+            };
+
+            const onDrop = (e) => {
+                e.preventDefault();
+                setIsDragOver(false);
+                if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                    handleFile(e.dataTransfer.files[0]);
+                }
+            };
+            
+            const [isDragOver, setIsDragOver] = useState(false);
+
+            // 優化後的樣式：負 Margin 裁切 + Scale 放大 + 底部裁切 (-80px)
+            const embedHtml = 
+                '<!DOCTYPE html>' +
+                '<html>' +
+                '<head>' + 
+                    '<style>' +
+                        'body { margin: 0; padding: 0; overflow: hidden; display: flex; justify-content: center; height: 100vh; font-family: sans-serif; background-color: #ffffff; }' +
+                        '#chart_wrapper {' +
+                            'width: 100%;' +
+                            /* 'margin-top: -110px;'  REMOVED: 上方裁切 */
+                            /* 'padding-top: 20px;'   REMOVED: 上方緩衝區 */
+                            'margin-bottom: -80px;' + /* 下方裁切 -80px */
+                            'transform: scale(1.15);' + /* 放大 15% */
+                            'transform-origin: top center;' +
+                            'text-align: center;' +
+                        '}' +
+                    '</style>' + 
+                '</head>' +
+                '<body>' +
+                    '<div id="chart_wrapper">' +
+                        '<div id="' + chartId + '" style="width:100%; height:100%;"></div>' +
+                        '<script type="text/javascript" src="https://www.statcounter.com/js/fusioncharts.js"><\/script>' +
+                        '<script type="text/javascript" src="' + chartSrc + '"><\/script>' +
+                    '</div>' +
+                '</body>' +
+                '</html>';
+
+            return (
+                <div className="flex flex-col gap-6">
+                    {/* 圖表區塊 - 高度微調 */}
+                    <div className="w-full h-[650px] bg-white rounded-xl shadow-lg border-2 border-indigo-100 p-1 flex flex-col items-center justify-center relative transition-all hover:shadow-xl overflow-hidden group">
+                        <iframe 
+                            key={chartId} 
+                            title="StatCounter Chart"
+                            srcDoc={embedHtml}
+                            className="w-full h-full border-0"
+                            sandbox="allow-scripts allow-same-origin allow-popups"
+                        />
+                        <div className="absolute bottom-1 right-2 text-[9px] text-gray-400 bg-white/80 px-2 rounded pointer-events-none">Source: StatCounter Global Stats</div>
+                    </div>
+
+                    {/* 自動同步狀態列 */}
+                    {autoSyncStatus === 'loading' && (
+                        <div className="bg-indigo-50 border border-indigo-200 rounded-xl p-4 flex items-center justify-center gap-3 animate-pulse">
+                            <div className="loader"></div>
+                            <span className="text-indigo-700 font-medium text-sm">正在嘗試自動同步數據... (透過 Proxy)</span>
+                        </div>
+                    )}
+
+                    {autoSyncStatus === 'success' && (
+                        <div className="bg-green-50 border border-green-200 rounded-xl p-3 flex items-center justify-between px-6">
+                            <div className="flex items-center gap-2">
+                                <svg className="w-5 h-5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"></path></svg>
+                                <span className="text-green-800 font-medium text-sm">數據已同步完成</span>
+                            </div>
+                            <span className="text-xs text-green-600">下方表格已更新</span>
+                        </div>
+                    )}
+
+                    {/* 如果自動同步失敗，顯示手動備案工具 */}
+                    {autoSyncStatus === 'error' && (
+                        <div 
+                            className={`border-2 border-dashed rounded-xl p-6 flex flex-col md:flex-row items-center justify-between gap-4 transition-colors duration-200 ${
+                                isDragOver ? 'border-blue-500 bg-blue-50' : 'border-orange-300 bg-orange-50'
+                            }`}
+                            onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+                            onDragLeave={() => setIsDragOver(false)}
+                            onDrop={onDrop}
+                        >
+                            <div className="flex items-center gap-3">
+                                <div className="bg-white p-2 rounded-full text-orange-500 shadow-sm">
+                                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                                </div>
+                                <div>
+                                    <h4 className="font-bold text-gray-800 text-sm">外部網站阻擋了自動抓取 (Anti-Bot)</h4>
+                                    <p className="text-xs text-gray-500">請下載 CSV 檔案，並將其<strong>拖曳到此區域</strong>即可顯示。</p>
+                                </div>
+                            </div>
+
+                            <div className="flex items-center gap-3 w-full md:w-auto">
+                                <a 
+                                    href={csvLink} 
+                                    target="_blank"
+                                    className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-50 transition shadow-sm whitespace-nowrap"
+                                >
+                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                                    1. 點擊下載 CSV
+                                </a>
+                                
+                                <div className="relative flex-1 md:w-64">
+                                    <input 
+                                        type="file" 
+                                        accept=".csv"
+                                        onChange={(e) => handleFile(e.target.files[0])}
+                                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+                                    />
+                                    <div className="flex items-center justify-center gap-2 px-4 py-2 bg-orange-600 text-white rounded-lg text-sm font-medium hover:bg-orange-700 transition shadow-sm dashed-border border-2 border-transparent hover:border-white/30">
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                                        2. 上傳或拖曳
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // --- Other Components ---
+        const BarChart = ({ data, color }) => {
+            const chartRef = useRef(null);
+            const canvasRef = useRef(null);
+            useEffect(() => {
+                if (!canvasRef.current || !data) return;
+                if (chartRef.current) chartRef.current.destroy();
+                const ctx = canvasRef.current.getContext('2d');
+                chartRef.current = new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: data.map(d => d.label),
+                        datasets: [{ label: '市佔率 (%)', data: data.map(d => d.value), backgroundColor: color || 'rgba(59, 130, 246, 0.7)', borderRadius: 4 }]
+                    },
+                    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true } } }
+                });
+                return () => { if (chartRef.current) chartRef.current.destroy(); };
+            }, [data, color]);
+            return <div className="h-[500px] w-full"><canvas ref={canvasRef}></canvas></div>;
+        };
+
+        const ConfigPanel = ({ isOpen, onClose, config, setConfig, onFileChange, onRefresh }) => {
+            if (!isOpen) return null;
+            return (
+                <div className="fixed inset-y-0 right-0 z-50 w-80 bg-white shadow-2xl border-l transform transition-transform overflow-y-auto">
+                    <div className="p-4 border-b flex justify-between items-center bg-gray-50">
+                        <h2 className="font-bold text-gray-800">資料源設定</h2>
+                        <button onClick={onClose} className="text-gray-500 hover:text-gray-700">✕</button>
+                    </div>
+                    <div className="p-5 space-y-6">
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-2">1. 選擇匯入方式</label>
+                            <div className="flex flex-col gap-3">
+                                <label className={`flex items-center gap-3 p-3 border rounded-lg cursor-pointer transition ${config.mode === 'live' ? 'border-indigo-500 bg-indigo-50' : 'hover:bg-gray-50'}`}>
+                                    <input type="radio" name="mode" checked={config.mode === 'live'} onChange={() => setConfig({...config, mode: 'live'})} className="text-indigo-600" />
+                                    <div className="text-sm"><div className="font-medium text-gray-900">StatCounter 即時圖表</div><div className="text-xs text-gray-500">直接嵌入 + 自動同步數據</div></div>
+                                </label>
+                                <label className={`flex items-center gap-3 p-3 border rounded-lg cursor-pointer transition ${config.mode === 'upload' ? 'border-blue-500 bg-blue-50' : 'hover:bg-gray-50'}`}>
+                                    <input type="radio" name="mode" checked={config.mode === 'upload'} onChange={() => setConfig({...config, mode: 'upload'})} className="text-blue-600" />
+                                    <div className="text-sm"><div className="font-medium text-gray-900">僅上傳 CSV</div><div className="text-xs text-gray-500">離線分析</div></div>
+                                </label>
+                                <label className={`flex items-center gap-3 p-3 border rounded-lg cursor-pointer transition ${config.mode === 'url' ? 'border-green-500 bg-green-50' : 'hover:bg-gray-50'}`}>
+                                    <input type="radio" name="mode" checked={config.mode === 'url'} onChange={() => setConfig({...config, mode: 'url'})} className="text-green-600" />
+                                    <div className="text-sm"><div className="font-medium text-gray-900">Google Sheet / URL</div><div className="text-xs text-gray-500">外部連結</div></div>
+                                </label>
+                                <label className={`flex items-center gap-3 p-3 border rounded-lg cursor-pointer transition ${config.mode === 'mock' ? 'border-gray-500 bg-gray-50' : 'hover:bg-gray-50'}`}>
+                                    <input type="radio" name="mode" checked={config.mode === 'mock'} onChange={() => setConfig({...config, mode: 'mock'})} className="text-gray-600" />
+                                    <div className="text-sm"><div className="font-medium text-gray-900">使用模擬數據</div><div className="text-xs text-gray-500">測試用</div></div>
+                                </label>
+                            </div>
+                        </div>
+                        {config.mode === 'upload' && (<div className="animate-fade-in-down"><label className="block text-sm font-medium text-gray-700 mb-1">選擇檔案</label><input type="file" accept=".csv" onChange={onFileChange} className="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"/><p className="text-xs text-gray-500 mt-2">支援格式: StatCounter Bar Chart CSV</p></div>)}
+                        {config.mode === 'url' && (<div className="animate-fade-in-down"><label className="block text-sm font-medium text-gray-700 mb-1">CSV 網址</label><input type="text" className="w-full border rounded p-2 text-sm focus:ring-2 focus:ring-green-500 focus:outline-none" placeholder="https://docs.google.com/..." value={config.csvUrl} onChange={(e) => setConfig({...config, csvUrl: e.target.value})}/></div>)}
+                        {config.mode !== 'live' && (<button onClick={onRefresh} className="w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700 transition shadow-sm font-medium">讀取數據</button>)}
+                    </div>
+                </div>
+            );
+        };
+
+        const App = () => {
+            const calculateDefaultDates = () => {
+                const now = new Date();
+                const endDateObj = new Date(now.getFullYear(), now.getMonth(), 0);
+                const startDateObj = new Date(endDateObj.getFullYear(), endDateObj.getMonth() - 5, 1);
+                const formatMonth = (date) => {
+                    const y = date.getFullYear();
+                    const m = String(date.getMonth() + 1).padStart(2, '0');
+                    return `${y}-${m}`;
+                };
+                return { start: formatMonth(startDateObj), end: formatMonth(endDateObj) };
+            };
+
+            const defaultDates = calculateDefaultDates();
+            const [filters, setFilters] = useState({ monthStart: defaultDates.start, monthEnd: defaultDates.end, deviceType: 'mobile', region: 'Global' });
+            const [config, setConfig] = useState({ mode: 'live', csvUrl: '' });
+            const [data, setData] = useState(null); // 用於儲存「上傳」或「讀取」後的數據
+            const [loading, setLoading] = useState(false);
+            const [configOpen, setConfigOpen] = useState(false);
+            const [uploadedFile, setUploadedFile] = useState(null);
+
+            const handleFileChange = (e) => {
+                if (e.target.files && e.target.files[0]) {
+                    setUploadedFile(e.target.files[0]);
+                    handleRefresh(e.target.files[0]);
+                }
+            };
+
+            // 手動更新數據邏輯
+            const handleRefresh = async (fileOverride = null) => {
+                if (config.mode === 'live') return; // Live 模式下，除非有檔案傳入，否則不自動刷新
+                setLoading(true);
+                try {
+                    let result = [];
+                    if (config.mode === 'upload' || (config.mode === 'live' && fileOverride)) {
+                        const fileToRead = fileOverride || uploadedFile;
+                        if (fileToRead) result = await DataService.readLocalFile(fileToRead);
+                        else if (config.mode !== 'live') { alert("請先選擇 CSV 檔案"); setLoading(false); return; }
+                    } else if (config.mode === 'url') {
+                        if (config.csvUrl) result = await DataService.fetchFromUrl(config.csvUrl);
+                        else { alert("請輸入 Google Sheet / CSV 網址"); setLoading(false); return; }
+                    } else if (config.mode === 'mock') {
+                        result = await DataService.getMockData(filters);
+                    }
+                    setData(result);
+                } catch (e) {
+                    console.error("Error loading data:", e);
+                    alert("讀取失敗，請確認檔案格式是否正確。");
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            useEffect(() => { 
+                // 只有非 Live 模式才自動刷新資料，Live 模式由 Embed 元件內部處理顯示
+                if (config.mode !== 'live') handleRefresh(); 
+                // 清空數據當切換到 Live 模式，等待使用者手動上傳
+                if (config.mode === 'live') setData(null);
+            }, [config.mode]);
+
+            return (
+                <div className="flex min-h-screen">
+                    <aside className="w-72 bg-white border-r border-gray-200 p-6 flex-shrink-0 overflow-y-auto shadow-sm z-10">
+                        <div className="flex items-center gap-2 mb-8 text-blue-700">
+                            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
+                            <h1 className="text-xl font-bold">解析度觀測站</h1>
+                        </div>
+                        {/* Filters... */}
+                        <div className="mb-6">
+                            <label className="block text-xs font-bold text-gray-500 uppercase mb-2">1. 時間範圍 (月度)</label>
+                            <div className="space-y-2">
+                                <input type="month" className="w-full border rounded p-2 text-sm shadow-sm focus:ring-2 focus:ring-blue-200 focus:border-blue-400 outline-none" value={filters.monthStart} onChange={(e) => setFilters({...filters, monthStart: e.target.value})} />
+                                <div className="text-center text-gray-400 text-xs">to</div>
+                                <input type="month" className="w-full border rounded p-2 text-sm shadow-sm focus:ring-2 focus:ring-blue-200 focus:border-blue-400 outline-none" value={filters.monthEnd} onChange={(e) => setFilters({...filters, monthEnd: e.target.value})} />
+                            </div>
+                        </div>
+                        <div className="mb-6">
+                            <label className="block text-xs font-bold text-gray-500 uppercase mb-2">2. 裝置類型</label>
+                            <div className="space-y-1">
+                                {['all', 'mobile', 'desktop', 'tablet'].map(type => (
+                                    <label key={type} className="flex items-center gap-2 p-2 rounded hover:bg-gray-50 cursor-pointer transition">
+                                        <input type="radio" name="dtype" checked={filters.deviceType === type} onChange={() => setFilters({...filters, deviceType: type})} className="text-blue-600 focus:ring-blue-500" />
+                                        <span className="text-sm text-gray-700 capitalize">{type}</span>
+                                    </label>
+                                ))}
+                            </div>
+                        </div>
+                        <div className="mb-6">
+                            <label className="block text-xs font-bold text-gray-500 uppercase mb-2">3. 地區</label>
+                            <select className="w-full border rounded p-2 text-sm shadow-sm focus:ring-2 focus:ring-blue-200 focus:border-blue-400 outline-none bg-white" value={filters.region} onChange={(e) => setFilters({...filters, region: e.target.value})}>
+                                {['Global', 'TW', 'US', 'JP', 'CN', 'HK'].map(r => <option key={r} value={r}>{r}</option>)}
+                            </select>
+                        </div>
+                        {config.mode !== 'live' && (<div className="border-t pt-4"><button onClick={() => handleRefresh()} className="w-full flex items-center justify-center gap-2 bg-blue-50 text-blue-600 hover:bg-blue-100 py-2 rounded font-medium transition"><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>重新整理 CSV</button></div>)}
+                    </aside>
+                    <main className="flex-1 p-8 overflow-y-auto">
+                        <div className="flex justify-between items-center mb-6">
+                            <div>
+                                <h2 className="text-2xl font-bold text-gray-900">解析度市佔分析報告</h2>
+                                <p className="text-sm text-gray-500 mt-1 flex gap-2 items-center"><span className={`px-2 py-0.5 rounded text-xs text-white ${config.mode === 'live' ? 'bg-indigo-500' : 'bg-gray-500'}`}>來源: {config.mode === 'live' ? 'StatCounter 即時圖表' : (config.mode === 'upload' ? 'CSV 檔案' : (config.mode === 'mock' ? '模擬資料' : 'Google Sheet'))}</span>{filters.region} | {filters.deviceType} | {filters.monthStart}~{filters.monthEnd}</p>
+                            </div>
+                            <button onClick={() => setConfigOpen(true)} className={`px-4 py-2 border rounded-lg text-sm flex items-center gap-2 transition shadow-sm ${configOpen ? 'bg-blue-50 border-blue-300 text-blue-700' : 'bg-white hover:bg-gray-50 text-gray-600 border-gray-200'}`}><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>資料源設定</button>
+                        </div>
+                        {config.mode === 'live' ? (<div className="grid grid-cols-1 gap-6"><StatCounterEmbed filters={filters} onDataLoaded={setData} />{data && <StatsTable data={data} title="圖表數據同步列表" filters={filters} />}</div>) : (<>{loading ? (<div className="h-64 flex flex-col items-center justify-center text-gray-400 gap-2"><div className="w-8 h-8 border-4 border-blue-200 border-t-blue-600 rounded-full animate-spin"></div><span>處理數據中...</span></div>) : data && data.length > 0 ? (<div className="grid grid-cols-1 gap-6"><div className="bg-white p-4 rounded-xl shadow-lg border-2 border-gray-100"><h3 className="text-lg font-bold text-gray-800 mb-4 flex justify-between"><span>排行總覽 (Top 15)</span><span className="text-sm font-normal text-gray-500">樣本數: {data.length} 筆</span></h3><BarChart data={data} color={filters.deviceType === 'mobile' ? 'rgba(16, 185, 129, 0.7)' : 'rgba(59, 130, 246, 0.7)'}/><StatsTable data={data} filters={filters}/></div></div>) : (<div className="flex flex-col items-center justify-center h-64 border-2 border-dashed border-gray-200 rounded-xl bg-gray-50"><p className="text-gray-500 font-medium mb-2">暫無數據</p><button onClick={() => setConfigOpen(true)} className="text-blue-600 hover:underline text-sm">請點此設定資料來源 (匯入 CSV 或 切換至即時圖表)</button></div>)}</>)}
+                    </main>
+                    <ConfigPanel isOpen={configOpen} onClose={() => setConfigOpen(false)} config={config} setConfig={setConfig} onFileChange={handleFileChange} onRefresh={() => handleRefresh()}/>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
